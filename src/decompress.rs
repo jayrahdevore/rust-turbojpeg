@@ -8,6 +8,7 @@ use crate::handle::Handle;
 #[doc(alias = "tjhandle")]
 pub struct Decompressor {
     handle: Handle,
+    scaling_factor: turbojpeg_sys::tjscalingfactor,
 }
 
 unsafe impl Send for Decompressor {}
@@ -34,7 +35,7 @@ impl Decompressor {
     #[doc(alias = "tj3Init")]
     pub fn new() -> Result<Decompressor> {
         let handle = Handle::new(raw::TJINIT_TJINIT_DECOMPRESS)?;
-        Ok(Self { handle })
+        Ok(Self { handle, scaling_factor: turbojpeg_sys::tjscalingfactor { num: 1, denom: 1} })
     }
 
     /// Read the JPEG header without decompressing the image.
@@ -111,6 +112,7 @@ impl Decompressor {
     #[doc(alias = "tj3Decompress8")]
     pub fn decompress(&mut self, jpeg_data: &[u8], output: Image<&mut [u8]>) -> Result<()> {
         output.assert_valid(output.pixels.len());
+        assert!(self.scaling_factor.num == 1);
         let Image { pixels, width, pitch, height, format } = output;
         let width: libc::c_int = width.try_into().map_err(|_| Error::IntegerOverflow("width"))?;
         let pitch: libc::c_int = pitch.try_into().map_err(|_| Error::IntegerOverflow("pitch"))?;
@@ -127,8 +129,8 @@ impl Decompressor {
             return Err(self.handle.get_error())
         }
 
-        let jpeg_width = self.handle.get(raw::TJPARAM_TJPARAM_JPEGWIDTH);
-        let jpeg_height = self.handle.get(raw::TJPARAM_TJPARAM_JPEGHEIGHT);
+        let jpeg_width = (self.handle.get(raw::TJPARAM_TJPARAM_JPEGWIDTH) + (self.scaling_factor.num - 1)) / self.scaling_factor.denom;
+        let jpeg_height = (self.handle.get(raw::TJPARAM_TJPARAM_JPEGHEIGHT) + (self.scaling_factor.num - 1)) / self.scaling_factor.denom;
         if width < jpeg_width || height < jpeg_height {
             return Err(Error::OutputTooSmall(jpeg_width as i32, jpeg_height as i32))
         }
@@ -218,6 +220,30 @@ impl Decompressor {
             return Err(self.handle.get_error())
         }
 
+        Ok(())
+    }
+
+    /// set image downscale to one of [1 (None), 2, 4, 8]
+    pub fn set_downscale_factor(&mut self, factor: u8) -> Result<()> {
+        match factor {
+            1 => {},
+            2 => {
+                self.scaling_factor = turbojpeg_sys::tjscalingfactor { num: 1, denom: 2 };
+                self.handle.set_scaling_factor(self.scaling_factor)?
+            },
+            4 => {
+                self.scaling_factor = turbojpeg_sys::tjscalingfactor { num: 1, denom: 4 };
+                self.handle.set_scaling_factor(self.scaling_factor)?
+            },
+            8 => {
+                self.scaling_factor = turbojpeg_sys::tjscalingfactor { num: 1, denom: 8 };
+                self.handle.set_scaling_factor(self.scaling_factor)?
+            },
+            _ => {
+                return Err(Error::TurboJpegError("Bad downscale factor: must be one of [1, 2, 4, 8]".to_string()))
+            }
+            
+        }
         Ok(())
     }
 }
