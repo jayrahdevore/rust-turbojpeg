@@ -1,4 +1,5 @@
 use std::convert::TryInto as _;
+use raw::tjscalingfactor;
 use crate::{Image, YuvImage, raw};
 use crate::common::{PixelFormat, Subsamp, Colorspace, Result, Error};
 use crate::handle::Handle;
@@ -27,6 +28,64 @@ pub struct DecompressHeader {
     pub subsamp: Subsamp,
     /// Colorspace of the compressed image.
     pub colorspace: Colorspace,
+}
+
+/// Scaling factor for efficient downscale
+///
+/// Turbojpeg gives us the ability to downscale by skipping DCT coefficients
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DownscaleFactor {
+    /// No downscale
+    None,
+    /// 1/2 scale resolution
+    OneHalf,
+    /// 1/4 scale resolution
+    OneQuarter,
+    /// 1/8 scale resolution
+    OneEighth
+}
+
+impl Into<tjscalingfactor> for DownscaleFactor {
+    fn into(self) -> tjscalingfactor {
+        match self {
+            Self::None => tjscalingfactor { num: 1, denom: 1 },
+            Self::OneHalf => tjscalingfactor { num: 1, denom: 2 },
+            Self::OneQuarter => tjscalingfactor { num: 1, denom: 4 },
+            Self::OneEighth => tjscalingfactor { num: 1, denom: 8 },
+        }
+    }
+}
+
+impl DecompressHeader {
+    /// Convenience method that returns a new instance of the decompress header with the given scale
+    /// # Example
+    ///
+    /// ```
+    /// // read JPEG data from file
+    /// let jpeg_data = std::fs::read("examples/parrots.jpg")?;
+    ///
+    /// // read JPEG header to check initial dimensions
+    /// let header = turbojpeg::read_header(&jpeg_data)?;
+    /// assert_eq!((header.width, header.height), (384, 256));
+    ///
+    ///
+    /// // check header size after scale
+    ///
+    /// let scale_factor = turbojpeg::DownscaleFactor::OneHalf;
+    /// let scaled_header = header.with_scale(scale_factor);
+    /// assert_eq!((scaled_header.width, scaled_header.height), (192, 128));
+    ///
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    pub fn with_scale(&self, factor: DownscaleFactor) -> Self {
+        let factor: tjscalingfactor = factor.into();
+        Self {
+            width: (self.width + (factor.denom - 1) as usize) / factor.denom as usize,
+            height: (self.height + (factor.denom - 1) as usize) / factor.denom as usize,
+            subsamp: self.subsamp,
+            colorspace: self.colorspace
+        }
+    }
 }
 
 impl Decompressor {
@@ -145,6 +204,77 @@ impl Decompressor {
         }
 
         Ok(())
+    }
+
+    /// Decompress a JPEG image in `jpeg_data` into `output` using a downscale factor
+    ///
+    /// The decompressed image is stored in the pixel data of the given `output` image, which must
+    /// be fully initialized by the caller. Use [`read_header()`](Decompressor::read_header) to
+    /// determine the image size before calling this method, and be sure to scale the output appropriately.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// // read JPEG data from file
+    /// let jpeg_data = std::fs::read("examples/parrots.jpg")?;
+    ///
+    /// // define a downscale
+    /// let downscale = turbojpeg::DownscaleFactor::OneHalf;
+    ///
+    /// // initialize a decompressor
+    /// let mut decompressor = turbojpeg::Decompressor::new()?;
+    ///
+    /// // read the JPEG header, downscaling the width and height
+    /// let scaled_header = decompressor.read_header(&jpeg_data)?.with_scale(downscale);
+    ///
+    /// // initialize the image (Image<Vec<u8>>)
+    /// let mut image = turbojpeg::Image {
+    ///     pixels: vec![0; 4 * scaled_header.width * scaled_header.height],
+    ///     width: scaled_header.width,
+    ///     pitch: 4 * scaled_header.width, // size of one image row in memory
+    ///     height: scaled_header.height,
+    ///     format: turbojpeg::PixelFormat::RGBA,
+    /// };
+    ///
+    /// // decompress the JPEG into the image
+    /// // (we use as_deref_mut() to convert from &mut Image<Vec<u8>> into Image<&mut [u8]>)
+    /// decompressor.decompress_with_downscale(&jpeg_data, image.as_deref_mut(), downscale)?;
+    /// assert_eq!(&image.pixels[0..5], &[125, 121, 92, 255, 127]);
+    ///
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn decompress_with_downscale(&mut self, jpeg_data: &[u8], output: Image<&mut [u8]>, downscale_factor: DownscaleFactor) -> Result<()> {
+
+        output.assert_valid(output.pixels.len());
+        let Image { pixels, width, pitch, height, format } = output;
+        let width: libc::c_int = width.try_into().map_err(|_| Error::IntegerOverflow("width"))?;
+        let pitch: libc::c_int = pitch.try_into().map_err(|_| Error::IntegerOverflow("pitch"))?;
+        let height: libc::c_int = height.try_into().map_err(|_| Error::IntegerOverflow("height"))?;
+
+        let scaled_header = self.read_header(jpeg_data)?.with_scale(downscale_factor);
+
+        if width < scaled_header.width as i32 || height < scaled_header.height as i32 {
+            return Err(Error::OutputTooSmall(scaled_header.width as i32, scaled_header.height as i32))
+        }
+
+        self.handle.set_scaling_factor(downscale_factor.into())?;
+
+        let res = unsafe {
+            raw::tj3Decompress8(
+                self.handle.as_ptr(),
+                jpeg_data.as_ptr(), jpeg_data.len() as raw::size_t,
+                pixels.as_mut_ptr(), pitch, format as i32,
+            )
+        };
+        // reset since we've mutated the scale factor
+        self.handle.set_scaling_factor(DownscaleFactor::None.into())?;
+
+        if res != 0 {
+            return Err(self.handle.get_error())
+        }
+
+        Ok(())
+
     }
 
     /// Decompress a JPEG image in `jpeg_data` into `output` as YUV without changing color space.
